@@ -20,6 +20,7 @@ pub struct Metrics {
     pub spend_flush_errors: Counter<u64>,
     pub spend_records_quarantined: Counter<u64>,
     pub bedrock_throttle_count: Counter<u64>,
+    pub request_fields_stripped: Counter<u64>,
     pub in_flight_requests: opentelemetry::metrics::UpDownCounter<i64>,
     prometheus_registry: Registry,
     // Keep the provider alive for the lifetime of `Metrics`.
@@ -114,6 +115,12 @@ impl Metrics {
             bedrock_throttle_count: meter
                 .u64_counter("ccag.bedrock.throttles.total")
                 .with_description("Total Bedrock throttling events")
+                .build(),
+            request_fields_stripped: meter
+                .u64_counter("ccag.request_fields_stripped.total")
+                .with_description(
+                    "Request fields removed and the request retried after Bedrock rejected them",
+                )
                 .build(),
             in_flight_requests: meter
                 .i64_up_down_counter("ccag.requests.in_flight")
@@ -219,6 +226,17 @@ impl Metrics {
             attrs.push(KeyValue::new("endpoint_id", ep.to_string()));
         }
         self.bedrock_throttle_count.add(1, &attrs);
+    }
+
+    /// Record a request field stripped after Bedrock rejected it (`field` is a short stable name).
+    pub fn record_field_stripped(&self, field: &str, model: &str) {
+        self.request_fields_stripped.add(
+            1,
+            &[
+                KeyValue::new("field", field.to_string()),
+                KeyValue::new("model", model.to_string()),
+            ],
+        );
     }
 
     /// Render Prometheus metrics as text.

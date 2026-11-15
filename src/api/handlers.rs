@@ -12,6 +12,7 @@ use futures::stream::StreamExt;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::field_strip;
 use crate::auth::CachedKey;
 use crate::auth::oidc::OidcIdentity;
 use crate::db::spend::RequestLogEntry;
@@ -1349,6 +1350,75 @@ async fn handle_non_streaming(
         .send()
         .await;
 
+    // Strip-and-retry for request fields Bedrock rejects (`output_config`, `thinking.display`).
+    // Runs before the beta net. Up to `MAX_ROUNDS` rounds: if none succeeds, the original error is
+    // returned. The beta net rebuilds from `body_bytes`, which carries the stripped body forward, but
+    // it reads the original error, so a beta rejected only after a strip is not retried.
+    let (result, body_bytes) = match result {
+        Err(ref e) if matches!(e, aws_sdk_bedrockruntime::error::SdkError::ServiceError(svc) if svc.err().is_validation_exception()) =>
+        {
+            // Bedrock names one bad field per rejection, so a body with two bad fields needs two
+            // rounds; each round strips what the latest error names and retries.
+            let mut current = body_bytes;
+            let mut err_text = format!("{e:?}");
+            let mut recovered = None;
+            let mut last_failure = None;
+            for round in 1..=field_strip::MAX_ROUNDS {
+                let Some(stripped) = field_strip::strip_rejected_fields(&current, &err_text) else {
+                    break;
+                };
+                tracing::info!(
+                    model = %bedrock_model,
+                    round,
+                    fields = ?stripped.fields,
+                    "ValidationException named request fields — stripping them and retrying"
+                );
+                for field in &stripped.fields {
+                    state
+                        .metrics
+                        .record_field_stripped(field_metric_name(field), bedrock_model);
+                }
+                current = stripped.bytes;
+                let retry = runtime_client
+                    .invoke_model()
+                    .model_id(bedrock_model)
+                    .content_type("application/json")
+                    .accept("application/json")
+                    .body(Blob::new(current.clone()))
+                    .send()
+                    .await;
+                match retry {
+                    Ok(_) => {
+                        recovered = Some(retry);
+                        break;
+                    }
+                    Err(ref re) => {
+                        err_text = format!("{re:?}");
+                        last_failure = Some(err_text.clone());
+                        if !matches!(re, aws_sdk_bedrockruntime::error::SdkError::ServiceError(svc) if svc.err().is_validation_exception())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            match recovered {
+                Some(retry) => (retry, current),
+                None => {
+                    if let Some(failure) = last_failure {
+                        tracing::warn!(
+                            model = %bedrock_model,
+                            error = %failure,
+                            "Retry without the stripped request fields also failed — returning the original error"
+                        );
+                    }
+                    (result, current)
+                }
+            }
+        }
+        _ => (result, body_bytes),
+    };
+
     // Check for ValidationException that names a known beta — retry once with those
     // betas stripped, and mark them as unsupported in the capability cache.
     let result = if let Err(ref e) = result {
@@ -1583,6 +1653,15 @@ async fn handle_non_streaming(
     }
 }
 
+/// Stable metric label for a stripped field path (`messages.3.output_config` -> `output_config`).
+fn field_metric_name(path: &str) -> &'static str {
+    if path.ends_with("output_config") {
+        "output_config"
+    } else {
+        "thinking_display"
+    }
+}
+
 /// Strip the given `rejected_betas` from the `anthropic_beta` array in `body_bytes`.
 ///
 /// Returns the re-serialized bytes, or `None` if the body can't be parsed.
@@ -1622,6 +1701,74 @@ async fn handle_streaming(
         .body(Blob::new(body_bytes.clone()))
         .send()
         .await;
+
+    // Strip-and-retry for request fields Bedrock rejects (`output_config`, `thinking.display`).
+    // Runs before the beta net. Up to `MAX_ROUNDS` rounds: if none succeeds, the original error is
+    // returned. The beta net rebuilds from `body_bytes`, which carries the stripped body forward, but
+    // it reads the original error, so a beta rejected only after a strip is not retried.
+    let (result, body_bytes) = match result {
+        Err(ref e) if matches!(e, aws_sdk_bedrockruntime::error::SdkError::ServiceError(svc) if svc.err().is_validation_exception()) =>
+        {
+            // Bedrock names one bad field per rejection, so a body with two bad fields needs two
+            // rounds; each round strips what the latest error names and retries.
+            let mut current = body_bytes;
+            let mut err_text = format!("{e:?}");
+            let mut recovered = None;
+            let mut last_failure = None;
+            for round in 1..=field_strip::MAX_ROUNDS {
+                let Some(stripped) = field_strip::strip_rejected_fields(&current, &err_text) else {
+                    break;
+                };
+                tracing::info!(
+                    model = %bedrock_model,
+                    round,
+                    fields = ?stripped.fields,
+                    "ValidationException named request fields (stream) — stripping them and retrying"
+                );
+                for field in &stripped.fields {
+                    state
+                        .metrics
+                        .record_field_stripped(field_metric_name(field), bedrock_model);
+                }
+                current = stripped.bytes;
+                let retry = runtime_client
+                    .invoke_model_with_response_stream()
+                    .model_id(bedrock_model)
+                    .content_type("application/json")
+                    .body(Blob::new(current.clone()))
+                    .send()
+                    .await;
+                match retry {
+                    Ok(_) => {
+                        recovered = Some(retry);
+                        break;
+                    }
+                    Err(ref re) => {
+                        err_text = format!("{re:?}");
+                        last_failure = Some(err_text.clone());
+                        if !matches!(re, aws_sdk_bedrockruntime::error::SdkError::ServiceError(svc) if svc.err().is_validation_exception())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            match recovered {
+                Some(retry) => (retry, current),
+                None => {
+                    if let Some(failure) = last_failure {
+                        tracing::warn!(
+                            model = %bedrock_model,
+                            error = %failure,
+                            "Retry without the stripped request fields also failed — returning the original error"
+                        );
+                    }
+                    (result, current)
+                }
+            }
+        }
+        _ => (result, body_bytes),
+    };
 
     // Check for ValidationException naming a known beta — retry once with those betas stripped.
     let (result, beta_ctx) = if let Err(ref e) = result {

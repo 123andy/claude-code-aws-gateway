@@ -79,6 +79,7 @@ All metrics use the `ccag` prefix (dots in instrument names become underscores i
 |---|---|---|---|
 | `ccag.errors.total` | Counter | `error_type`, `endpoint_id` | Bedrock/upstream errors |
 | `ccag.bedrock.throttles.total` | Counter | `model`, `endpoint_id` | Bedrock throttling events |
+| `ccag.request_fields_stripped.total` | Counter | `field` (`output_config`, `thinking_display`), `model` | Client-sent fields the gateway removed, before retrying, after Bedrock rejected them (up to 5 rounds per request) |
 | `ccag.rate_limits.total` | Counter | | Gateway rate limit rejections |
 | `ccag.auth_failures.total` | Counter | `reason` | Authentication failures |
 

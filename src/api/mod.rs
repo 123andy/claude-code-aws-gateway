@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod cli_auth;
+mod field_strip;
 mod handlers;
 #[cfg(feature = "mock-bedrock")]
 pub mod mock_bedrock;
