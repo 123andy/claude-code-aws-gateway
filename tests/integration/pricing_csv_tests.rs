@@ -14,6 +14,18 @@ use ccag::pricing::{normalize_service_name, parse_price_list_csv};
 // CSV header used by the AWS Bedrock Foundation Models price list (confirmed by live fetch).
 const CSV_HEADER: &str = r#""SKU","OfferTermCode","RateCode","TermType","PriceDescription","EffectiveDate","StartingRange","EndingRange","Unit","PricePerUnit","Currency","Location","Location Type","usageType","operation","Region Code","serviceName""#;
 
+// The metadata preamble AWS prepends to every price list file downloaded via
+// GetPriceListFileUrl. Five two-column rows, then the real 17-column header.
+// Reproduced verbatim (modulo the disclaimer text) from a live fetch of
+// arn:aws:pricing:::price-list/aws/AmazonBedrockFoundationModels/USD/.../us-east-1
+const CSV_PREAMBLE: &str = concat!(
+    "\"FormatVersion\",\"v1.0\"\n",
+    "\"Disclaimer\",\"This pricing list is for informational purposes only.\"\n",
+    "\"Publication Date\",\"2026-07-03T08:58:57Z\"\n",
+    "\"Version\",\"20260703085857\"\n",
+    "\"OfferCode\",\"AmazonBedrockFoundationModels\"\n",
+);
+
 // Build a minimal CSV string from header + rows.
 fn csv_with_rows(rows: &[&str]) -> String {
     let mut out = CSV_HEADER.to_string();
@@ -23,6 +35,12 @@ fn csv_with_rows(rows: &[&str]) -> String {
         out.push('\n');
     }
     out
+}
+
+// Same as `csv_with_rows`, but prefixed with AWS's metadata preamble — i.e.
+// byte-for-byte what `refresh_pricing` actually feeds the parser in production.
+fn csv_with_preamble_rows(rows: &[&str]) -> String {
+    format!("{CSV_PREAMBLE}{}", csv_with_rows(rows))
 }
 
 // Build a single quoted CSV row with the fields the parser cares about.
@@ -651,4 +669,336 @@ fn includes_non_anthropic_models_with_complete_global_dimensions() {
     result.sort_by(|a, b| a.model_prefix.cmp(&b.model_prefix));
     assert_eq!(result[0].model_prefix, "claude-haiku-4-5");
     assert_eq!(result[1].model_prefix, "llama-4-scout");
+}
+
+// -----------------------------------------------------------------------
+// Regression: the real price list file carries a metadata preamble
+// -----------------------------------------------------------------------
+
+/// A price list downloaded from `GetPriceListFileUrl` begins with five
+/// two-column metadata rows before the header. Feeding that to a
+/// `has_headers(true)` reader made the csv crate adopt `"FormatVersion","v1.0"`
+/// as a 2-field header, so every 17-field data row failed the equal-length
+/// check and was dropped, and `refresh_pricing` reported "Nothing changed".
+#[test]
+fn preamble_is_skipped_and_rows_are_parsed() {
+    let service = "Claude Opus 4.8 (Amazon Bedrock Edition)";
+    let csv = csv_with_preamble_rows(&[
+        &make_row(
+            "SKU-O48-INPUT",
+            "AWS Marketplace software usage|us-east-1|Input Tokens - Standard, Global",
+            "5.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O48-OUTPUT",
+            "AWS Marketplace software usage|us-east-1|Output Tokens - Standard, Global",
+            "25.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O48-CREAD",
+            "AWS Marketplace software usage|us-east-1|Cache Read Tokens - Standard, Global",
+            "0.5000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O48-CWRITE",
+            "AWS Marketplace software usage|us-east-1|Cache Write Tokens - Standard, Global",
+            "6.2500000000",
+            service,
+        ),
+    ]);
+
+    let result = parse_price_list_csv(&csv).expect("parse should succeed");
+
+    assert_eq!(
+        result.len(),
+        1,
+        "preamble must be skipped so the data rows parse; got {} rows",
+        result.len()
+    );
+    assert_pricing(&result[0], "claude-opus-4-8", 5.0, 25.0, 0.5, 6.25);
+}
+
+/// A CSV that already starts at the header row must keep working — the fix
+/// must not depend on a preamble being present.
+#[test]
+fn header_only_csv_still_parses_without_preamble() {
+    let service = "Claude Sonnet 5 (Amazon Bedrock Edition)";
+    let csv = csv_with_rows(&[
+        &make_row(
+            "SKU-S5-INPUT",
+            "AWS Marketplace software usage|us-east-1|Input Tokens - Standard, Global",
+            "2.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S5-OUTPUT",
+            "AWS Marketplace software usage|us-east-1|Output Tokens - Standard, Global",
+            "10.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S5-CREAD",
+            "AWS Marketplace software usage|us-east-1|Cache Read Tokens - Standard, Global",
+            "0.2000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S5-CWRITE",
+            "AWS Marketplace software usage|us-east-1|Cache Write Tokens - Standard, Global",
+            "2.5000000000",
+            service,
+        ),
+    ]);
+
+    let result = parse_price_list_csv(&csv).expect("parse should succeed");
+    assert_eq!(result.len(), 1, "header-only CSV must still parse");
+    assert_pricing(&result[0], "claude-sonnet-5", 2.0, 10.0, 0.2, 2.5);
+}
+
+// -----------------------------------------------------------------------
+// Test 11: The older AWS naming convention parses (Opus 4.5/4.6,
+// Sonnet 4/4.5/4.6, Haiku 4.5)
+// -----------------------------------------------------------------------
+//
+// AWS uses two spellings for the same four dimensions. Rows that match
+// neither are skipped before the model's accumulator is created, so a model
+// on an unknown spelling produces no row and no "missing dimension" warning.
+//
+// Descriptions below are verbatim from the live us-east-1 price list
+// (AmazonBedrockFoundationModels, published 2026-08-14). Note AWS calls output
+// "Response" in this convention.
+#[test]
+fn parses_old_convention_global_rates() {
+    let service = "Claude Haiku 4.5 (Amazon Bedrock Edition)";
+    let csv = csv_with_rows(&[
+        &make_row(
+            "SKU-HAIKU-INPUT",
+            "AWS Marketplace software usage|us-east-1|Million Input Tokens Global",
+            "1.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-HAIKU-OUTPUT",
+            "AWS Marketplace software usage|us-east-1|Million Response Tokens Global",
+            "5.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-HAIKU-CREAD",
+            "AWS Marketplace software usage|us-east-1|Million Cache Read Input Tokens Global",
+            "0.1000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-HAIKU-CWRITE",
+            "AWS Marketplace software usage|us-east-1|Million Cache Write Input Tokens Global",
+            "1.2500000000",
+            service,
+        ),
+    ]);
+
+    let result = parse_price_list_csv(&csv).expect("parse should succeed");
+    assert_eq!(result.len(), 1, "old-convention model must produce a row");
+    assert_pricing(&result[0], "claude-haiku-4-5", 1.0, 5.0, 0.1, 1.25);
+}
+
+// -----------------------------------------------------------------------
+// Test 12: Old-convention REGIONAL rows are still skipped
+// -----------------------------------------------------------------------
+//
+// The regional rates are ~10% higher than global. Sonnet 4.6 also ships a
+// third marker, "Regional CRIS". Neither must ever be ingested — we bill the
+// Global CRIS rate.
+#[test]
+fn skips_old_convention_regional_rows() {
+    let service = "Claude Sonnet 4.6 (Amazon Bedrock Edition)";
+    let csv = csv_with_rows(&[
+        &make_row(
+            "SKU-S46-INPUT-REGIONAL",
+            "AWS Marketplace software usage|us-east-1|Million Input Tokens Regional CRIS",
+            "3.3000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S46-OUTPUT-REGIONAL",
+            "AWS Marketplace software usage|us-east-1|Million Response Tokens Regional CRIS",
+            "16.5000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S46-CREAD-REGIONAL",
+            "AWS Marketplace software usage|us-east-1|Million Cache Read Input Tokens Regional",
+            "0.3300000000",
+            service,
+        ),
+        &make_row(
+            "SKU-S46-CWRITE-REGIONAL",
+            "AWS Marketplace software usage|us-east-1|Million Cache Write Input Tokens Regional",
+            "4.1250000000",
+            service,
+        ),
+    ]);
+
+    let result = parse_price_list_csv(&csv).expect("parse should succeed");
+    assert_eq!(
+        result.len(),
+        0,
+        "regional-only CSV must produce no rows, whichever convention it uses"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Test 13: "Global" decoy rows must never be ingested
+// -----------------------------------------------------------------------
+//
+// REGRESSION GUARD — do not relax the match arms to a substring test.
+//
+// Gating on `last.contains("Global")` instead would match about 40 extra rows
+// in the live price list, because AWS puts "Global" on batch,
+// reserved-throughput and 1-hour cache-write dimensions too. Two concrete corruptions it causes:
+//
+//   "Input Tokens - Batch, Global"       -> Opus 5 input 5.00 becomes 2.50
+//   "Million 1 hour Cache Write ... Global" -> cache write 6.25 becomes 10.00
+//
+// Note the older convention spells the 1-hour variant "1 hour", not "1h TTL",
+// so the existing 1h-TTL exclusion does not catch it either.
+//
+// This test pairs a complete, valid set of old-convention rows with every
+// decoy family. The rates asserted are the correct ones; if a decoy leaks in,
+// the corresponding rate moves and this fails.
+#[test]
+fn skips_global_decoy_rows() {
+    let service = "Claude Opus 4.5 (Amazon Bedrock Edition)";
+    let csv = csv_with_rows(&[
+        // --- the real dimensions ---
+        &make_row(
+            "SKU-O45-INPUT",
+            "AWS Marketplace software usage|us-east-1|Million Input Tokens Global",
+            "5.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O45-OUTPUT",
+            "AWS Marketplace software usage|us-east-1|Million Response Tokens Global",
+            "25.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O45-CREAD",
+            "AWS Marketplace software usage|us-east-1|Million Cache Read Input Tokens Global",
+            "0.5000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O45-CWRITE",
+            "AWS Marketplace software usage|us-east-1|Million Cache Write Input Tokens Global",
+            "6.2500000000",
+            service,
+        ),
+        // --- decoys, all containing "Global" ---
+        &make_row(
+            "SKU-O45-BATCH-IN",
+            "AWS Marketplace software usage|us-east-1|Million Batch Input Tokens Global",
+            "2.5000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O45-BATCH-OUT",
+            "AWS Marketplace software usage|us-east-1|Million Batch Response Tokens Global",
+            "12.5000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O45-CWRITE-1H",
+            "AWS Marketplace software usage|us-east-1|Million 1 hour Cache Write Input Tokens Global",
+            "10.0000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O45-TPM-IN",
+            "AWS Marketplace software usage|us-east-1|Per Hour per 1K Input TPM Reserved 1 Month Global",
+            "0.3000000000",
+            service,
+        ),
+        &make_row(
+            "SKU-O45-TPM-OUT",
+            "AWS Marketplace software usage|us-east-1|Per Hour per 1K Output TPM Reserved 1 Month Global",
+            "1.5000000000",
+            service,
+        ),
+        // New-convention batch decoy, as shipped for Opus 5.
+        &make_row(
+            "SKU-O45-BATCH-NEWCONV",
+            "AWS Marketplace software usage|us-east-1|Input Tokens - Batch, Global",
+            "2.5000000000",
+            service,
+        ),
+    ]);
+
+    let result = parse_price_list_csv(&csv).expect("parse should succeed");
+    assert_eq!(result.len(), 1, "expected exactly one model row");
+    // Correct on-demand Global rates — not the batch/1-hour/reserved figures.
+    assert_pricing(&result[0], "claude-opus-4-5", 5.0, 25.0, 0.5, 6.25);
+}
+
+// -----------------------------------------------------------------------
+// Test 14: The current 22-column layout (Product Family, Feature, Inference
+// Type, Model and Provider added; `serviceName` moved from position 16 to 21).
+// Columns are found by header name, so extra or reordered ones must not matter.
+// -----------------------------------------------------------------------
+const WIDE_HEADER: &str = r#""SKU","OfferTermCode","RateCode","TermType","PriceDescription","EffectiveDate","StartingRange","EndingRange","Unit","PricePerUnit","Currency","Product Family","Location","Location Type","usageType","operation","Feature","Inference Type","Model","Provider","Region Code","serviceName""#;
+
+fn wide_row(
+    sku: &str,
+    price_description: &str,
+    price_per_unit: &str,
+    service_name: &str,
+) -> String {
+    format!(
+        r#""{sku}","JRTCKXETXF","JRTCKXETXF.JRTCKXETXF.6YS6EN2CT7","OnDemand","{price_description}","2026-01-01T00:00:00Z","0","Inf","1M tokens","{price_per_unit}","USD","Generative AI","US East (N. Virginia)","AWS Region","USE1-Tokens","InvokeModel","On-demand Inference","Input tokens","Claude","Anthropic","us-east-1","{service_name}""#
+    )
+}
+
+#[test]
+fn wide_layout_keeps_models_apart() {
+    let mut csv = String::from(CSV_PREAMBLE);
+    csv.push_str(WIDE_HEADER);
+    csv.push('\n');
+    for (service, base) in [
+        ("Claude Opus 5.5 (Amazon Bedrock Edition)", 5.0),
+        ("Claude Sonnet 5.5 (Amazon Bedrock Edition)", 3.0),
+    ] {
+        for (dim, mult) in [
+            ("Input Tokens - Standard, Global", 1.0),
+            ("Output Tokens - Standard, Global", 5.0),
+            ("Cache Read Tokens - Standard, Global", 0.1),
+            ("Cache Write Tokens - Standard, Global", 1.25),
+        ] {
+            let price = format!("{:.10}", base * mult);
+            csv.push_str(&wide_row(
+                &format!("SKU-{service}-{dim}"),
+                &format!("AWS Marketplace software usage|us-east-1|{dim}"),
+                &price,
+                service,
+            ));
+            csv.push('\n');
+        }
+    }
+
+    let mut result = parse_price_list_csv(&csv).expect("parse should succeed");
+    result.sort_by(|a, b| a.model_prefix.cmp(&b.model_prefix));
+
+    assert_eq!(result.len(), 2, "one row per model, got {result:?}");
+    assert_pricing(&result[0], "claude-opus-5-5", 5.0, 25.0, 0.5, 6.25);
+    assert_pricing(&result[1], "claude-sonnet-5-5", 3.0, 15.0, 0.3, 3.75);
+}
+
+#[test]
+fn missing_service_name_column_is_an_error() {
+    let csv = "\"SKU\",\"PriceDescription\",\"PricePerUnit\"\n\"S\",\"Input Tokens - Standard, Global\",\"1.0\"\n";
+    let err = parse_price_list_csv(csv).expect_err("a missing column must not parse as zero rows");
+    assert!(err.to_string().contains("serviceName"), "got: {err}");
 }

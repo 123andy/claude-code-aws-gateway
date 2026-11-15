@@ -26,6 +26,37 @@ pub fn normalize_service_name(service_name: &str) -> String {
 // CSV parser
 // ---------------------------------------------------------------------------
 
+/// Drop the metadata preamble that AWS prepends to every price list CSV.
+///
+/// A price list file downloaded from `GetPriceListFileUrl` starts with five
+/// two-column metadata rows before the real header:
+///
+/// ```text
+/// "FormatVersion","v1.0"
+/// "Disclaimer","This pricing list is for informational purposes only..."
+/// "Publication Date","2026-07-03T08:58:57Z"
+/// "Version","20260703085857"
+/// "OfferCode","AmazonBedrockFoundationModels"
+/// "SKU","OfferTermCode",...          <-- header starts here
+/// ```
+///
+/// Handing the raw text to a `has_headers(true)` reader makes the csv crate
+/// treat `"FormatVersion","v1.0"` as a two-field header, after which *every*
+/// longer data row fails the equal-length check and is discarded. Returns
+/// the slice beginning at the header row, or the input unchanged when no
+/// header is found (the parser then fails on the missing columns).
+fn strip_preamble(csv: &str) -> &str {
+    let mut offset = 0;
+    for line in csv.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("\"SKU\"") || trimmed.starts_with("SKU,") {
+            return &csv[offset..];
+        }
+        offset += line.len();
+    }
+    csv
+}
+
 /// Intermediate accumulator while parsing rows for a single service/model.
 #[derive(Debug, Default)]
 struct ModelAccumulator {
@@ -49,10 +80,20 @@ fn classify_description(price_description: &str) -> Option<&'static str> {
         .trim();
 
     match last {
+        // Newer wording.
         "Input Tokens - Standard, Global" => Some("input"),
         "Output Tokens - Standard, Global" => Some("output"),
         "Cache Read Tokens - Standard, Global" => Some("cache_read"),
         "Cache Write Tokens - Standard, Global" => Some("cache_write"),
+        // Older wording, still used for some models (output is "Response").
+        // Keep these exact: the list also has "Global" batch, reserved and
+        // 1-hour cache-write rows ("Million Batch Input Tokens Global",
+        // "Input Tokens - Batch, Global", ...) that a substring match would
+        // mistake for on-demand rates.
+        "Million Input Tokens Global" => Some("input"),
+        "Million Response Tokens Global" => Some("output"),
+        "Million Cache Read Input Tokens Global" => Some("cache_read"),
+        "Million Cache Write Input Tokens Global" => Some("cache_write"),
         // 1h TTL and all other variants are skipped
         _ => None,
     }
@@ -71,20 +112,32 @@ fn classify_description(price_description: &str) -> Option<&'static str> {
 ///
 /// `source` is always `"price_list_api"` on every returned row.
 /// `aws_sku` is the SKU from the first `Input Tokens` row seen for the model.
+///
+/// Accepts both a raw price list file (with AWS's metadata preamble) and one
+/// that already begins at the header row — see [`strip_preamble`].
 pub fn parse_price_list_csv(csv: &str) -> Result<Vec<ModelPricing>> {
-    // Column indices (0-based).  The test header is:
-    // SKU | OfferTermCode | RateCode | TermType | PriceDescription |
-    // EffectiveDate | StartingRange | EndingRange | Unit | PricePerUnit |
-    // Currency | Location | Location Type | usageType | operation |
-    // Region Code | serviceName
-    const IDX_SKU: usize = 0;
-    const IDX_PRICE_DESC: usize = 4;
-    const IDX_PRICE_PER_UNIT: usize = 9;
-    const IDX_SERVICE_NAME: usize = 16;
-
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
-        .from_reader(csv.as_bytes());
+        .from_reader(strip_preamble(csv).as_bytes());
+
+    // Find columns by header name: AWS adds columns to this file, so fixed
+    // positions read the wrong fields. A missing column is an error, not zero rows.
+    let headers = reader
+        .headers()
+        .map_err(|e| anyhow::anyhow!("price list header unreadable: {e}"))?
+        .clone();
+    let column = |name: &str| headers.iter().position(|h| h.trim() == name);
+    let (Some(idx_sku), Some(idx_price_desc), Some(idx_price_per_unit), Some(idx_service_name)) = (
+        column("SKU"),
+        column("PriceDescription"),
+        column("PricePerUnit"),
+        column("serviceName"),
+    ) else {
+        anyhow::bail!(
+            "price list header lacks SKU, PriceDescription, PricePerUnit or serviceName: {:?}",
+            headers.iter().collect::<Vec<_>>()
+        );
+    };
 
     // Keyed by normalized model prefix.
     let mut accumulators: HashMap<String, ModelAccumulator> = HashMap::new();
@@ -98,13 +151,13 @@ pub fn parse_price_list_csv(csv: &str) -> Result<Vec<ModelPricing>> {
             }
         };
 
-        let service_name = match record.get(IDX_SERVICE_NAME) {
+        let service_name = match record.get(idx_service_name) {
             Some(s) => s.to_string(),
             None => continue,
         };
         let model_prefix = normalize_service_name(&service_name);
 
-        let price_desc = match record.get(IDX_PRICE_DESC) {
+        let price_desc = match record.get(idx_price_desc) {
             Some(s) => s.to_string(),
             None => continue,
         };
@@ -114,8 +167,8 @@ pub fn parse_price_list_csv(csv: &str) -> Result<Vec<ModelPricing>> {
             None => continue, // regional or 1h TTL or unknown — skip
         };
 
-        let sku = record.get(IDX_SKU).unwrap_or("").to_string();
-        let price_str = record.get(IDX_PRICE_PER_UNIT).unwrap_or("").to_string();
+        let sku = record.get(idx_sku).unwrap_or("").to_string();
+        let price_str = record.get(idx_price_per_unit).unwrap_or("").to_string();
 
         let acc = accumulators.entry(model_prefix).or_default();
 
