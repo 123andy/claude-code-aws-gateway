@@ -31,15 +31,19 @@ pub struct AnthropicRequest {
     pub top_p: Option<f64>,
     #[serde(default)]
     pub top_k: Option<u64>,
+    /// Server-side review request (auto mode). Forwarded only while the paired
+    /// `dangerous-tool-use-*` beta survives; see `betas::pair_safeguards`.
+    #[serde(default)]
+    pub safeguards: Option<Value>,
     // MCP connector (Anthropic-only beta feature) — accepted but not forwarded to Bedrock
     #[serde(default)]
     #[allow(dead_code)]
     pub mcp_servers: Option<Vec<Value>>,
-    /// Beta flags from the client. CC sends them under the JSON key `"betas"`; the
-    /// `anthropic-beta` HTTP header is merged in at the handler layer before calling
-    /// `translate()`. Two aliases accepted: `"betas"` (CC wire format) and
-    /// `"anthropic_beta"` (internal/legacy). Filtered through the capability cache
-    /// at the handler boundary, not here — `translate()` is a pure passthrough.
+    /// Beta flags from the client's JSON body (`"betas"`, or `"anthropic_beta"` for internal use).
+    /// Claude Code sends its betas in the `anthropic-beta` HTTP header instead, which the handler
+    /// does not forward, except the `dangerous-tool-use-*` family (see
+    /// `betas::safeguards_betas_from_header`). Filtered through the capability cache at the
+    /// handler boundary, not here: `translate()` is a pure passthrough.
     #[serde(default, alias = "betas", alias = "anthropic_beta")]
     pub anthropic_beta: Vec<String>,
 }
@@ -70,6 +74,8 @@ pub struct BedrockRequest {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safeguards: Option<Value>,
 }
 
 /// Allowed fields inside a `cache_control` object for Bedrock.
@@ -158,6 +164,7 @@ pub fn translate(
         temperature: req.temperature,
         top_p: req.top_p,
         top_k: req.top_k,
+        safeguards: req.safeguards,
     };
 
     (bedrock_model, bedrock_req, web_search_ctx)
@@ -183,6 +190,7 @@ mod tests {
             temperature: None,
             top_p: None,
             top_k: None,
+            safeguards: None,
             mcp_servers: None,
             anthropic_beta: vec![],
         }
@@ -196,6 +204,38 @@ mod tests {
         assert_eq!(body.anthropic_version, "bedrock-2023-05-31");
         assert_eq!(body.max_tokens, 1024);
         assert!(ws_ctx.is_none());
+    }
+
+    #[test]
+    fn test_safeguards_deserialize_and_serialize_unchanged() {
+        // The field (shape captured from Claude Code in auto mode) must reach Bedrock verbatim.
+        let raw = json!({
+            "model": "claude-sonnet-5-5", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "betas": ["dangerous-tool-use-2026-09-03"],
+            "safeguards": [{"type": "dangerous_tool_use",
+                "classifier_context": {"v": 1, "permission_mode": "auto"}}]
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw.clone()).unwrap();
+        let (_, body, _) = translate(req, "eu", None, "enabled");
+        let out = serde_json::to_value(&body).unwrap();
+        assert_eq!(out["safeguards"], raw["safeguards"]);
+        assert_eq!(
+            out["anthropic_beta"],
+            json!(["dangerous-tool-use-2026-09-03"])
+        );
+    }
+
+    #[test]
+    fn test_no_safeguards_means_no_field() {
+        let req = make_request("claude-sonnet-5-5");
+        let (_, body, _) = translate(req, "eu", None, "enabled");
+        assert!(
+            serde_json::to_value(&body)
+                .unwrap()
+                .get("safeguards")
+                .is_none()
+        );
     }
 
     #[test]

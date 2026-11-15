@@ -64,6 +64,23 @@ mod tests {
         assert_eq!(normalized["model"], "claude-sonnet-4-6-20250514");
     }
 
+    /// Server-side review results (auto mode) must reach the client unchanged.
+    #[test]
+    fn test_safeguard_results_passthrough() {
+        let results = json!([{"type": "dangerous_tool_use", "status": {"type": "available",
+            "tool_uses": {"toolu_1": {"type": "evaluated", "outcome": "not_flagged"}}}}]);
+        let resp = json!({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}],
+            "model": "eu.anthropic.claude-sonnet-5-5", "stop_reason": "tool_use",
+            "safeguard_results": results,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let out = normalize_response(resp, "claude-sonnet-5-5", None);
+        assert_eq!(out["safeguard_results"], results);
+        assert_eq!(out["content"][0]["id"], "toolu_1");
+    }
+
     /// Regression lock: `stop_reason: "refusal"` on a Bedrock HTTP-200 response
     /// must pass through `normalize_response` unchanged. Fable 5 can return this
     /// stop reason; the gateway must not rewrite or drop it.

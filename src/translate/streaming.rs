@@ -102,6 +102,21 @@ mod tests {
         );
     }
 
+    /// Server-side review results ride in `message_delta.delta`; the normalizer must keep them.
+    #[test]
+    fn test_stream_message_delta_keeps_safeguard_results() {
+        let results = json!([{"type": "dangerous_tool_use", "status": {"type": "available",
+            "tool_uses": {"toolu_1": {"type": "evaluated", "outcome": "not_flagged"}}}}]);
+        let event = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "safeguard_results": results},
+            "usage": {"output_tokens": 5}
+        });
+        let normalized = normalize_stream_event(event, "claude-sonnet-5-5", None);
+        assert_eq!(normalized["delta"]["safeguard_results"], results);
+        assert_eq!(normalized["delta"]["stop_reason"], "tool_use");
+    }
+
     /// Regression lock: a `message_delta` SSE event with `delta.stop_reason: "refusal"`
     /// must pass through `normalize_stream_event` with the field intact. Fable 5
     /// can emit this stop reason over streaming; the gateway must not rewrite or drop it.

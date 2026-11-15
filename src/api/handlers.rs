@@ -801,6 +801,15 @@ pub async fn messages(
         tracing::info!(request_id = %request_id, "Web search tool detected, interception enabled");
     }
 
+    // ── Server-side review beta (auto mode) ──────────────────────────────────
+    // `safeguards` only goes where a retry net exists for a profile that rejects it: a selected
+    // endpoint, and not the web-search loop.
+    prepare_safeguards(
+        &mut bedrock_body,
+        &headers,
+        selected_endpoint.is_some() && web_search_ctx.is_none(),
+    );
+
     // ── Beta capability filtering ────────────────────────────────────────────
     // Filter anthropic_beta through the per-endpoint capability cache.
     // Betas the cache says Some(false) are dropped here to avoid a Bedrock
@@ -833,6 +842,10 @@ pub async fn messages(
     } else {
         None
     };
+
+    // `safeguards` must not travel without its beta (Bedrock answers 400), and the cache filter
+    // above may have dropped the beta.
+    beta_filter::pair_safeguards(&bedrock_body.anthropic_beta, &mut bedrock_body.safeguards);
 
     let body_bytes = match serde_json::to_vec(&bedrock_body) {
         Ok(b) => b,
@@ -1363,6 +1376,7 @@ async fn handle_non_streaming(
             let mut err_text = format!("{e:?}");
             let mut recovered = None;
             let mut last_failure = None;
+            let mut all_removed_betas: Vec<String> = Vec::new();
             for round in 1..=field_strip::MAX_ROUNDS {
                 let Some(stripped) = field_strip::strip_rejected_fields(&current, &err_text) else {
                     break;
@@ -1379,6 +1393,7 @@ async fn handle_non_streaming(
                         .record_field_stripped(field_metric_name(field), bedrock_model);
                 }
                 current = stripped.bytes;
+                all_removed_betas.extend(stripped.betas);
                 let retry = runtime_client
                     .invoke_model()
                     .model_id(bedrock_model)
@@ -1389,6 +1404,19 @@ async fn handle_non_streaming(
                     .await;
                 match retry {
                     Ok(_) => {
+                        // The profile cannot do server-side review: remember it so the next
+                        // request is sent without the pair instead of paying this retry.
+                        if let Some(ctx) = &beta_ctx {
+                            for beta in &all_removed_betas {
+                                ctx.endpoint_client
+                                    .mark_unsupported(
+                                        &ctx.profile,
+                                        beta,
+                                        ProbeSource::RequestRejection,
+                                    )
+                                    .await;
+                            }
+                        }
                         recovered = Some(retry);
                         break;
                     }
@@ -1460,10 +1488,11 @@ async fn handle_non_streaming(
                     match retry_result {
                         Ok(output) => {
                             // Retry succeeded — opportunistically learn remaining unknown betas.
+                            let sent = betas_in_body(&body_bytes);
                             let remaining_unknown: Vec<String> = ctx
                                 .unknown_betas
                                 .iter()
-                                .filter(|b| !rejected.contains(b))
+                                .filter(|b| !rejected.contains(b) && sent.contains(b))
                                 .cloned()
                                 .collect();
                             for beta in &remaining_unknown {
@@ -1547,7 +1576,9 @@ async fn handle_non_streaming(
         Ok(output) => {
             // Opportunistic learning: betas whose cache state was None are now known to work.
             if let Some(ref ctx) = beta_ctx {
-                for beta in &ctx.unknown_betas {
+                // Only betas still in the body that succeeded: a strip may have removed some.
+                let sent = betas_in_body(&body_bytes);
+                for beta in ctx.unknown_betas.iter().filter(|b| sent.contains(b)) {
                     ctx.endpoint_client
                         .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
                         .await;
@@ -1655,11 +1686,50 @@ async fn handle_non_streaming(
 
 /// Stable metric label for a stripped field path (`messages.3.output_config` -> `output_config`).
 fn field_metric_name(path: &str) -> &'static str {
-    if path.ends_with("output_config") {
+    if path == "safeguards" {
+        "safeguards"
+    } else if path.ends_with("output_config") {
         "output_config"
     } else {
         "thinking_display"
     }
+}
+
+/// Claude Code sends the `dangerous-tool-use-*` beta in the `anthropic-beta` header, next to the
+/// `safeguards` body field. Move that beta into the Bedrock body's `anthropic_beta` so the
+/// capability filter and retry nets see it. Where `recoverable` is false, send neither.
+fn prepare_safeguards(body: &mut request::BedrockRequest, headers: &HeaderMap, recoverable: bool) {
+    if !recoverable {
+        body.safeguards = None;
+        body.anthropic_beta
+            .retain(|b| !beta_filter::is_safeguards_beta(b));
+        return;
+    }
+    if body.safeguards.is_some() {
+        for beta in beta_filter::safeguards_betas_from_header(headers) {
+            if !body.anthropic_beta.contains(&beta) {
+                body.anthropic_beta.push(beta);
+            }
+        }
+    } else {
+        // The beta without its field is rejected on profiles that lack server-side review.
+        body.anthropic_beta
+            .retain(|b| !beta_filter::is_safeguards_beta(b));
+    }
+}
+
+/// The `anthropic_beta` entries of a serialized Bedrock request body.
+fn betas_in_body(body_bytes: &[u8]) -> Vec<String> {
+    serde_json::from_slice::<Value>(body_bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("anthropic_beta")?.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|b| b.as_str().map(String::from))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// Strip the given `rejected_betas` from the `anthropic_beta` array in `body_bytes`.
@@ -1715,6 +1785,7 @@ async fn handle_streaming(
             let mut err_text = format!("{e:?}");
             let mut recovered = None;
             let mut last_failure = None;
+            let mut all_removed_betas: Vec<String> = Vec::new();
             for round in 1..=field_strip::MAX_ROUNDS {
                 let Some(stripped) = field_strip::strip_rejected_fields(&current, &err_text) else {
                     break;
@@ -1731,6 +1802,7 @@ async fn handle_streaming(
                         .record_field_stripped(field_metric_name(field), bedrock_model);
                 }
                 current = stripped.bytes;
+                all_removed_betas.extend(stripped.betas);
                 let retry = runtime_client
                     .invoke_model_with_response_stream()
                     .model_id(bedrock_model)
@@ -1740,6 +1812,19 @@ async fn handle_streaming(
                     .await;
                 match retry {
                     Ok(_) => {
+                        // The profile cannot do server-side review: remember it so the next
+                        // request is sent without the pair instead of paying this retry.
+                        if let Some(ctx) = &beta_ctx {
+                            for beta in &all_removed_betas {
+                                ctx.endpoint_client
+                                    .mark_unsupported(
+                                        &ctx.profile,
+                                        beta,
+                                        ProbeSource::RequestRejection,
+                                    )
+                                    .await;
+                            }
+                        }
                         recovered = Some(retry);
                         break;
                     }
@@ -1836,7 +1921,9 @@ async fn handle_streaming(
             // Opportunistic learning: Bedrock accepted the request, so unknown betas are now known
             // to work. Fire mark_supported before spawning the stream task.
             if let Some(ref ctx) = beta_ctx {
-                for beta in &ctx.unknown_betas {
+                // Only betas still in the body that succeeded: a strip may have removed some.
+                let sent = betas_in_body(&body_bytes);
+                for beta in ctx.unknown_betas.iter().filter(|b| sent.contains(b)) {
                     ctx.endpoint_client
                         .mark_supported(&ctx.profile, beta, ProbeSource::RequestSuccess)
                         .await;
@@ -3613,6 +3700,94 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn safeguards_body(betas: &[&str]) -> request::BedrockRequest {
+        let raw = serde_json::json!({
+            "model": "claude-sonnet-5-5", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "betas": betas,
+            "safeguards": [{"type": "dangerous_tool_use"}]
+        });
+        let req: request::AnthropicRequest = serde_json::from_value(raw).unwrap();
+        request::translate(req, "eu", None, "enabled").1
+    }
+
+    fn beta_header(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-beta", v.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn safeguards_beta_is_taken_from_the_header() {
+        let mut body = safeguards_body(&[]);
+        prepare_safeguards(
+            &mut body,
+            &beta_header("claude-code-20250219,dangerous-tool-use-2026-09-03"),
+            true,
+        );
+        assert_eq!(body.anthropic_beta, vec!["dangerous-tool-use-2026-09-03"]);
+        assert!(body.safeguards.is_some());
+    }
+
+    #[test]
+    fn header_beta_is_not_duplicated_when_already_in_the_body() {
+        let mut body = safeguards_body(&["dangerous-tool-use-2026-09-03"]);
+        prepare_safeguards(
+            &mut body,
+            &beta_header("dangerous-tool-use-2026-09-03"),
+            true,
+        );
+        assert_eq!(body.anthropic_beta.len(), 1);
+    }
+
+    #[test]
+    fn without_a_safeguards_field_the_header_beta_is_not_added() {
+        let mut body = safeguards_body(&[]);
+        body.safeguards = None;
+        prepare_safeguards(
+            &mut body,
+            &beta_header("dangerous-tool-use-2026-09-03"),
+            true,
+        );
+        assert!(body.anthropic_beta.is_empty());
+    }
+
+    #[test]
+    fn unrecoverable_paths_send_neither_field_nor_beta() {
+        let mut body = safeguards_body(&["dangerous-tool-use-2026-09-03", "other-beta"]);
+        prepare_safeguards(
+            &mut body,
+            &beta_header("dangerous-tool-use-2026-09-03"),
+            false,
+        );
+        assert!(body.safeguards.is_none());
+        assert_eq!(body.anthropic_beta, vec!["other-beta"]);
+    }
+
+    #[test]
+    fn a_body_beta_without_the_field_is_removed() {
+        let mut body = safeguards_body(&["dangerous-tool-use-2026-09-03", "other-beta"]);
+        body.safeguards = None;
+        prepare_safeguards(&mut body, &HeaderMap::new(), true);
+        assert_eq!(body.anthropic_beta, vec!["other-beta"]);
+    }
+
+    #[test]
+    fn betas_in_body_reads_the_serialized_array() {
+        let body = safeguards_body(&["a-beta", "b-beta"]);
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert_eq!(betas_in_body(&bytes), vec!["a-beta", "b-beta"]);
+        assert!(betas_in_body(b"not json").is_empty());
+    }
+
+    #[test]
+    fn no_header_beta_means_pairing_drops_the_field() {
+        let mut body = safeguards_body(&[]);
+        prepare_safeguards(&mut body, &HeaderMap::new(), true);
+        beta_filter::pair_safeguards(&body.anthropic_beta, &mut body.safeguards);
+        assert!(body.safeguards.is_none());
+    }
+
     fn make_request(messages: Vec<Value>) -> request::AnthropicRequest {
         request::AnthropicRequest {
             model: "claude-sonnet-4-6-20250514".to_string(),
@@ -3628,6 +3803,7 @@ mod tests {
             temperature: None,
             top_p: None,
             top_k: None,
+            safeguards: None,
             mcp_servers: None,
             anthropic_beta: vec![],
         }
@@ -5095,6 +5271,7 @@ mod tests_extract_request_info_utf8 {
             temperature: None,
             top_p: None,
             top_k: None,
+            safeguards: None,
             mcp_servers: None,
             anthropic_beta: vec![],
         };
@@ -5171,6 +5348,7 @@ mod tests_extract_request_info_utf8 {
             temperature: None,
             top_p: None,
             top_k: None,
+            safeguards: None,
             mcp_servers: None,
             anthropic_beta: vec![],
         };

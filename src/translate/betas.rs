@@ -1,6 +1,39 @@
 //! Cache-aware beta filtering and Bedrock ValidationException parsing.
 
+use serde_json::Value;
+
 use crate::endpoint::EndpointClient;
+
+/// Prefix of the beta that enables server-side review of risky tool calls (auto mode). The date
+/// suffix changes between Claude Code releases, so match the prefix.
+pub const SAFEGUARDS_BETA_PREFIX: &str = "dangerous-tool-use-";
+
+pub fn is_safeguards_beta(beta: &str) -> bool {
+    beta.starts_with(SAFEGUARDS_BETA_PREFIX)
+}
+
+/// The `dangerous-tool-use-*` betas in the request's `anthropic-beta` header(s). Claude Code sends
+/// its betas in that header, not in the body. Only this family is read from the header: forwarding
+/// the rest would hit "invalid beta flag" (which names no beta) on older profiles.
+pub fn safeguards_betas_from_header(headers: &axum::http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|b| is_safeguards_beta(b))
+        .map(String::from)
+        .collect()
+}
+
+/// Keep `safeguards` only while its beta is in `betas`. Bedrock rejects the field without the
+/// beta ("Extra inputs are not permitted"), so the two must travel together.
+pub fn pair_safeguards(betas: &[String], safeguards: &mut Option<Value>) {
+    if !betas.iter().any(|b| is_safeguards_beta(b)) {
+        *safeguards = None;
+    }
+}
 
 /// Extract beta names from a Bedrock `ValidationException` error message.
 ///
@@ -72,6 +105,68 @@ mod tests {
             "interleaved-thinking-2025-05-14".to_string(),
             "claude-code-x".to_string(),
         ]
+    }
+
+    // ── safeguards_betas_from_header ──────────────────────────────────────────
+
+    #[test]
+    fn header_betas_keep_only_the_safeguards_family() {
+        let mut h = axum::http::HeaderMap::new();
+        h.append(
+            "anthropic-beta",
+            "claude-code-20250219, dangerous-tool-use-2026-09-03,effort-2025-11-24"
+                .parse()
+                .unwrap(),
+        );
+        h.append("anthropic-beta", "afk-mode-2026-01-31".parse().unwrap());
+        assert_eq!(
+            safeguards_betas_from_header(&h),
+            vec!["dangerous-tool-use-2026-09-03".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_header_means_no_betas() {
+        assert!(safeguards_betas_from_header(&axum::http::HeaderMap::new()).is_empty());
+    }
+
+    // ── pair_safeguards ───────────────────────────────────────────────────────
+
+    #[test]
+    fn safeguards_kept_when_beta_present() {
+        let mut sg = Some(serde_json::json!([{"type": "dangerous_tool_use"}]));
+        pair_safeguards(
+            &[
+                "claude-code-20250219".into(),
+                "dangerous-tool-use-2026-09-03".into(),
+            ],
+            &mut sg,
+        );
+        assert!(sg.is_some());
+    }
+
+    #[test]
+    fn safeguards_kept_for_a_future_dated_beta() {
+        let mut sg = Some(serde_json::json!([{}]));
+        pair_safeguards(&["dangerous-tool-use-2027-01-01".into()], &mut sg);
+        assert!(sg.is_some());
+    }
+
+    #[test]
+    fn safeguards_dropped_when_beta_absent() {
+        let mut sg = Some(serde_json::json!([{"type": "dangerous_tool_use"}]));
+        pair_safeguards(&["claude-code-20250219".into()], &mut sg);
+        assert!(sg.is_none());
+        let mut sg = Some(serde_json::json!([{}]));
+        pair_safeguards(&[], &mut sg);
+        assert!(sg.is_none());
+    }
+
+    #[test]
+    fn pairing_none_stays_none() {
+        let mut sg: Option<Value> = None;
+        pair_safeguards(&["dangerous-tool-use-2026-09-03".into()], &mut sg);
+        assert!(sg.is_none());
     }
 
     // ── parse_rejected_betas ──────────────────────────────────────────────────

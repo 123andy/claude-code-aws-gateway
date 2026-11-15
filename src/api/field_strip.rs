@@ -1,17 +1,22 @@
 //! Strip-and-retry for request fields Bedrock rejects.
 //!
 //! Bedrock validates the Anthropic request body more strictly than the Anthropic API, and Claude
-//! Code sometimes sends fields it does not accept. Two are known:
+//! Code sometimes sends fields it does not accept. Three are known:
 //!
 //! - `messages.N.output_config: Extra inputs are not permitted` (a top-level `output_config` is
 //!   already dropped by the request translation, so only the per-message form reaches Bedrock)
 //! - `thinking.adaptive.display: Input should be 'summarized', 'omitted'`
+//! - `safeguards: Extra inputs are not permitted` (older profiles lack server-side review). The
+//!   field and its `dangerous-tool-use-*` beta go together: the beta alone is rejected there too
+//!   (`invalid beta flag`, which names no beta, so the beta net cannot catch it).
 //!
 //! The handler retries the request without exactly the fields Bedrock named, one error at a time.
-//! Only the keys matched in `rejected_paths` are ever removed, and only when the error
-//! names them, so an unrelated 400 is never rewritten.
+//! Only the keys matched in `rejected_paths`, plus the top-level `safeguards`, are ever removed,
+//! and only when the error names them, so an unrelated 400 is never rewritten.
 
 use serde_json::Value;
+
+use crate::translate::betas::is_safeguards_beta;
 
 /// A rejected field that was removed from the request, e.g. `messages.1.output_config`.
 #[derive(Debug, PartialEq, Eq)]
@@ -19,6 +24,8 @@ pub struct Stripped {
     pub bytes: Vec<u8>,
     /// Dotted paths of the removed fields, in the form Bedrock reported them.
     pub fields: Vec<String>,
+    /// Betas removed alongside `safeguards`, so the caller can record them as unsupported.
+    pub betas: Vec<String>,
 }
 
 /// Strip-and-retry rounds per request. Bedrock has been seen reporting one bad field per
@@ -36,14 +43,31 @@ const THINKING_DISPLAY: &str = "thinking.adaptive.display: Input should be";
 /// `err` is the `Debug` form of the SDK error.
 pub fn strip_rejected_fields(body_bytes: &[u8], err: &str) -> Option<Stripped> {
     let wanted = rejected_paths(err);
-    if wanted.is_empty() {
+    let safeguards = names_safeguards(err);
+    if wanted.is_empty() && !safeguards {
         return None;
     }
     let mut body: Value = serde_json::from_slice(body_bytes).ok()?;
     let mut fields = Vec::new();
+    let mut betas = Vec::new();
     for path in wanted {
         if remove_path(&mut body, &path) {
             fields.push(path.reported);
+        }
+    }
+    if safeguards
+        && let Some(obj) = body.as_object_mut()
+        && obj.remove("safeguards").is_some()
+    {
+        fields.push("safeguards".to_string());
+        if let Some(arr) = obj.get_mut("anthropic_beta").and_then(|v| v.as_array_mut()) {
+            arr.retain(|v| match v.as_str() {
+                Some(b) if is_safeguards_beta(b) => {
+                    betas.push(b.to_string());
+                    false
+                }
+                _ => true,
+            });
         }
     }
     if fields.is_empty() {
@@ -52,7 +76,14 @@ pub fn strip_rejected_fields(body_bytes: &[u8], err: &str) -> Option<Stripped> {
     Some(Stripped {
         bytes: serde_json::to_vec(&body).ok()?,
         fields,
+        betas,
     })
+}
+
+/// True when the error says the top-level `safeguards` field is not accepted.
+fn names_safeguards(err: &str) -> bool {
+    err.match_indices(EXTRA_INPUTS)
+        .any(|(at, _)| path_before(err, at) == "safeguards")
 }
 
 struct Target {
@@ -171,6 +202,35 @@ mod tests {
         assert!(out["messages"][1].get("output_config").is_none());
         assert_eq!(out["messages"][1]["content"], "b");
         assert_eq!(out["messages"][0], body["messages"][0]);
+    }
+
+    #[test]
+    fn strips_safeguards_and_its_beta_together() {
+        let body = json!({"max_tokens":10,"safeguards":[{"type":"dangerous_tool_use"}],
+            "anthropic_beta":["claude-code-20250219","dangerous-tool-use-2026-09-03"]});
+        let err =
+            "ValidationException { message: Some(\"safeguards: Extra inputs are not permitted\") }";
+        let s = strip_rejected_fields(&serde_json::to_vec(&body).unwrap(), err).unwrap();
+        let out: Value = serde_json::from_slice(&s.bytes).unwrap();
+        assert_eq!(s.fields, vec!["safeguards"]);
+        assert_eq!(s.betas, vec!["dangerous-tool-use-2026-09-03"]);
+        assert!(out.get("safeguards").is_none());
+        assert_eq!(out["anthropic_beta"], json!(["claude-code-20250219"]));
+        assert_eq!(out["max_tokens"], 10);
+    }
+
+    #[test]
+    fn safeguards_error_with_no_safeguards_in_body_is_not_a_retry() {
+        let body = json!({"max_tokens":10});
+        let err = "safeguards: Extra inputs are not permitted";
+        assert!(strip_rejected_fields(&serde_json::to_vec(&body).unwrap(), err).is_none());
+    }
+
+    #[test]
+    fn nested_safeguards_path_is_not_the_top_level_field() {
+        let body = json!({"safeguards":[{}],"anthropic_beta":["dangerous-tool-use-2026-09-03"]});
+        let err = "messages.0.safeguards: Extra inputs are not permitted";
+        assert!(strip_rejected_fields(&serde_json::to_vec(&body).unwrap(), err).is_none());
     }
 
     #[test]
